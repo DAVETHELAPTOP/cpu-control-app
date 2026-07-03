@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# cpu_ctrl_helper - privileged backend for CPU Control GUI
+# Never run this directly for interactive use - it's invoked via pkexec by the GUI.
+set -uo pipefail
+
+[[ $EUID -ne 0 ]] && { echo "ERROR: must run as root"; exit 1; }
+
+do_action() {
+    local ACTION="$1" VALUE="$2"
+    case "$ACTION" in
+        ping)
+            echo "OK"
+            ;;
+
+        governor)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no governor given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set governor"
+            ;;
+
+        freq_max)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no frequency given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set max freq"
+            ;;
+
+        freq_min)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no frequency given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set min freq"
+            ;;
+
+        boost)
+            [[ "$VALUE" != "0" && "$VALUE" != "1" ]] && { echo "ERROR: boost value must be 0 or 1"; return 1; }
+            did=0
+            if [ -f /sys/devices/system/cpu/cpufreq/boost ]; then
+                echo "$VALUE" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null && did=1
+            fi
+            if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+                echo "$((1 - VALUE))" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null && did=1
+            fi
+            if [ -f /sys/devices/system/cpu/amd_pstate/no_turbo ]; then
+                echo "$((1 - VALUE))" > /sys/devices/system/cpu/amd_pstate/no_turbo 2>/dev/null && did=1
+            fi
+            [[ "$did" -eq 1 ]] && echo "OK" || echo "ERROR: no boost interface found on this system"
+            ;;
+
+        pstate_max)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no percentage given"; return 1; }
+            if [ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then
+                echo "$VALUE" > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null && echo "OK" || echo "ERROR: write failed"
+            else
+                echo "ERROR: intel_pstate not active on this system"
+            fi
+            ;;
+
+        install_deps)
+            missing=()
+            command -v sensors >/dev/null || missing+=("lm-sensors")
+            command -v cpupower >/dev/null || missing+=("cpupower")
+            if [ ${#missing[@]} -ne 0 ]; then
+                if command -v apt-get >/dev/null; then
+                    apt-get update -y
+                    apt-get install -y lm-sensors linux-cpupower "linux-tools-$(uname -r)" linux-tools-common || true
+                elif command -v pacman >/dev/null; then
+                    pacman -Sy --needed lm_sensors cpupower --noconfirm
+                elif command -v dnf >/dev/null; then
+                    dnf install -y lm_sensors kernel-tools
+                fi
+                modprobe coretemp 2>/dev/null || true
+                modprobe k10temp 2>/dev/null || true
+                modprobe zenpower 2>/dev/null || true
+            fi
+            echo "OK"
+            ;;
+
+        *)
+            echo "ERROR: unknown action '$ACTION'"
+            ;;
+    esac
+}
+
+ACTION="${1:-}"
+VALUE="${2:-}"
+
+if [[ "$ACTION" == "daemon" ]]; then
+    # Persistent mode: authenticated ONCE by pkexec when this process is
+    # launched, then stays alive reading one "action value" per line from
+    # stdin until the GUI exits or sends "exit". No further password
+    # prompts happen for the rest of the session.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        a="${line%% *}"
+        if [[ "$line" == *" "* ]]; then
+            v="${line#* }"
+        else
+            v=""
+        fi
+        if [[ "$a" == "exit" ]]; then
+            echo "OK"
+            break
+        fi
+        do_action "$a" "$v"
+    done
+    exit 0
+fi
+
+# One-shot mode (kept for manual/CLI use): pkexec cpu_ctrl_helper <action> <value>
+do_action "$ACTION" "$VALUE"

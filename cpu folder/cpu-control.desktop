@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CPU Control
+Comment=Real-time CPU monitor and frequency/governor control
+Exec=python3 /opt/cpu-control/cpu_ctrl_v3_5.py
+Icon=cpu
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
