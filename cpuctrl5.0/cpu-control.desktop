@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CPU Control
+Comment=Real-time CPU/RAM/Drive/GPU monitor and control panel (governor, freq, boost, RAM limits, zswap, drive benchmarking, settings)
+Exec=python3 /opt/cpu-control/cpu_ctrl_v5_0.py
+Icon=cpu
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true

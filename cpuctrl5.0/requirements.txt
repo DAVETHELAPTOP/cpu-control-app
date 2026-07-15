@@ -1,0 +1,14 @@
+# CPU Control v4.0 - Python dependencies
+#
+# Note: PyGObject (the "gi" module) requires system-level GTK/GObject
+# introspection libraries (libgirepository, GTK3 dev headers, etc.) to
+# build/run correctly. On Debian/Ubuntu/Mint these come from apt packages
+# (python3-gi, gir1.2-gtk-3.0, libgirepository1.0-dev, etc.), NOT from pip
+# alone. install.sh handles the apt side; this file exists so pip can
+# verify/install PyGObject itself if it's missing.
+#
+# The RAM tab (limits, zswap, swap-ratio) and GPU tab (beta) don't need
+# extra Python packages - they shell out to jq/lspci/vainfo/nvidia-smi,
+# which install.sh installs (or checks for) at the system level instead.
+
+PyGObject>=3.42.0

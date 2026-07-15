@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# cpu_ctrl_helper - privileged backend for CPU Control GUI (v4.0)
+# Never run this directly for interactive use - it's invoked via pkexec by the GUI.
+# Protocol: one "action value" per line in -> exactly ONE line out ("OK" or "ERROR: ...").
+# Every action below must therefore stay silent except for that single final line.
+set -uo pipefail
+
+[[ $EUID -ne 0 ]] && { echo "ERROR: must run as root"; exit 1; }
+
+RAMLIMIT_DIR="/var/lib/cpu-control"
+LIMITS_FILE="${RAMLIMIT_DIR}/ram_limits.json"
+mkdir -p "$RAMLIMIT_DIR" 2>/dev/null || true
+[[ -f "$LIMITS_FILE" ]] || echo '{}' > "$LIMITS_FILE" 2>/dev/null
+
+do_action() {
+    local ACTION="$1" VALUE="$2"
+    case "$ACTION" in
+        ping)
+            echo "OK"
+            ;;
+
+        # ---------------------------------------------------------- CPU
+        governor)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no governor given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set governor"
+            ;;
+
+        freq_max)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no frequency given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set max freq"
+            ;;
+
+        freq_min)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no frequency given"; return 1; }
+            ok=0
+            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+                echo "$VALUE" > "$cpu" 2>/dev/null && ok=1
+            done
+            [[ "$ok" -eq 1 ]] && echo "OK" || echo "ERROR: failed to set min freq"
+            ;;
+
+        boost)
+            [[ "$VALUE" != "0" && "$VALUE" != "1" ]] && { echo "ERROR: boost value must be 0 or 1"; return 1; }
+            did=0
+            if [ -f /sys/devices/system/cpu/cpufreq/boost ]; then
+                echo "$VALUE" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null && did=1
+            fi
+            if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+                echo "$((1 - VALUE))" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null && did=1
+            fi
+            if [ -f /sys/devices/system/cpu/amd_pstate/no_turbo ]; then
+                echo "$((1 - VALUE))" > /sys/devices/system/cpu/amd_pstate/no_turbo 2>/dev/null && did=1
+            fi
+            [[ "$did" -eq 1 ]] && echo "OK" || echo "ERROR: no boost interface found on this system"
+            ;;
+
+        pstate_max)
+            [[ -z "$VALUE" ]] && { echo "ERROR: no percentage given"; return 1; }
+            if [ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then
+                echo "$VALUE" > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null && echo "OK" || echo "ERROR: write failed"
+            elif [ -f /sys/devices/system/cpu/amd_pstate/max_perf_pct ]; then
+                echo "$VALUE" > /sys/devices/system/cpu/amd_pstate/max_perf_pct 2>/dev/null && echo "OK" || echo "ERROR: write failed"
+            else
+                echo "ERROR: P-State max-perf control not active on this system"
+            fi
+            ;;
+
+        install_deps)
+            missing=()
+            command -v sensors >/dev/null || missing+=("lm-sensors")
+            command -v cpupower >/dev/null || missing+=("cpupower")
+            command -v jq >/dev/null || missing+=("jq")
+            if [ ${#missing[@]} -ne 0 ]; then
+                if command -v apt-get >/dev/null; then
+                    apt-get update -y >/dev/null 2>&1
+                    apt-get install -y lm-sensors linux-cpupower jq mesa-utils vainfo smartmontools >/dev/null 2>&1 || true
+                    apt-get install -y "linux-tools-$(uname -r)" linux-tools-common >/dev/null 2>&1 \
+                        || apt-get install -y linux-perf >/dev/null 2>&1 || true
+                elif command -v pacman >/dev/null; then
+                    pacman -Sy --needed lm_sensors cpupower jq mesa-utils libva-utils smartmontools --noconfirm >/dev/null 2>&1 || true
+                elif command -v dnf >/dev/null; then
+                    dnf install -y lm_sensors kernel-tools jq mesa-demos libva-utils smartmontools >/dev/null 2>&1 || true
+                fi
+                modprobe coretemp 2>/dev/null || true
+                modprobe k10temp 2>/dev/null || true
+                modprobe zenpower 2>/dev/null || true
+            fi
+            echo "OK"
+            ;;
+
+        # ---------------------------------------------------------- RAM (merged from ramlimit2.0)
+        ram_limit)
+            # VALUE = "<pid> <limit_mb> <mode>"
+            local pid limit_mb mode
+            pid=$(awk '{print $1}' <<<"$VALUE")
+            limit_mb=$(awk '{print $2}' <<<"$VALUE")
+            mode=$(awk '{print $3}' <<<"$VALUE")
+            mode=${mode:-swap}
+            if [[ -z "$pid" || -z "$limit_mb" ]]; then echo "ERROR: pid and limit_mb required"; return 1; fi
+            if ! [[ "$pid" =~ ^[0-9]+$ && "$limit_mb" =~ ^[0-9]+$ ]]; then echo "ERROR: pid/limit_mb must be numeric"; return 1; fi
+            if ! ps -p "$pid" >/dev/null 2>&1; then echo "ERROR: PID $pid is not running"; return 1; fi
+
+            local limit_bytes=$(( limit_mb * 1024 * 1024 ))
+            local cmd; cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+
+            if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+                local cg="/sys/fs/cgroup/ramlimit_${pid}"
+                echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+                mkdir -p "$cg"
+                if ! echo "$pid" > "${cg}/cgroup.procs" 2>/dev/null; then
+                    rmdir "$cg" 2>/dev/null || true
+                    echo "ERROR: could not move PID into cgroup (may have exited)"; return 1
+                fi
+                if [[ "$mode" == "hard" ]]; then
+                    echo "$limit_bytes" > "${cg}/memory.max" 2>/dev/null
+                    echo "0" > "${cg}/memory.swap.max" 2>/dev/null || true
+                else
+                    echo "$limit_bytes" > "${cg}/memory.high" 2>/dev/null
+                    echo "max" > "${cg}/memory.max" 2>/dev/null
+                    echo "max" > "${cg}/memory.swap.max" 2>/dev/null || true
+                    local swappiness; swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo 60)
+                    [[ "$swappiness" -lt 60 ]] && echo 60 > /proc/sys/vm/swappiness 2>/dev/null || true
+                fi
+            elif [[ -d /sys/fs/cgroup/memory ]]; then
+                local cg="/sys/fs/cgroup/memory/ramlimit_${pid}"
+                mkdir -p "$cg"
+                echo "$limit_bytes" > "${cg}/memory.limit_in_bytes" 2>/dev/null
+                if [[ "$mode" == "hard" ]]; then
+                    echo "$limit_bytes" > "${cg}/memory.memsw.limit_in_bytes" 2>/dev/null || true
+                    echo "0" > "${cg}/memory.swappiness" 2>/dev/null || true
+                else
+                    echo "$(( limit_bytes * 4 ))" > "${cg}/memory.memsw.limit_in_bytes" 2>/dev/null || true
+                    echo "80" > "${cg}/memory.swappiness" 2>/dev/null || true
+                fi
+                if ! echo "$pid" > "${cg}/cgroup.procs" 2>/dev/null; then
+                    echo "ERROR: could not move PID into cgroup (may have exited)"; return 1
+                fi
+            else
+                echo "ERROR: cgroups not available on this system"; return 1
+            fi
+
+            if command -v jq >/dev/null; then
+                local limits; limits=$(cat "$LIMITS_FILE" 2>/dev/null || echo '{}')
+                echo "$limits" | jq -c --arg pid "$pid" --arg cmd "$cmd" --argjson limit "$limit_mb" --arg mode "$mode" \
+                    '.[$pid] = {"cmd":$cmd,"limit_mb":$limit,"mode":$mode}' > "$LIMITS_FILE" 2>/dev/null
+            fi
+            echo "OK"
+            ;;
+
+        ram_clear)
+            local pid="$VALUE"
+            [[ -z "$pid" ]] && { echo "ERROR: pid required"; return 1; }
+            if [[ -d "/sys/fs/cgroup/ramlimit_${pid}" ]]; then
+                while read -r p; do echo "$p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true; done < "/sys/fs/cgroup/ramlimit_${pid}/cgroup.procs" 2>/dev/null
+                rmdir "/sys/fs/cgroup/ramlimit_${pid}" 2>/dev/null || true
+            fi
+            [[ -d "/sys/fs/cgroup/memory/ramlimit_${pid}" ]] && rm -rf "/sys/fs/cgroup/memory/ramlimit_${pid}"
+            if command -v jq >/dev/null && [[ -f "$LIMITS_FILE" ]]; then
+                local limits; limits=$(cat "$LIMITS_FILE")
+                echo "$limits" | jq -c --arg pid "$pid" 'del(.[$pid])' > "$LIMITS_FILE" 2>/dev/null
+            fi
+            echo "OK"
+            ;;
+
+        ram_clear_all)
+            if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+                for cg in /sys/fs/cgroup/ramlimit_*/; do
+                    [[ -d "$cg" ]] || continue
+                    while read -r p; do echo "$p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true; done < "${cg}cgroup.procs" 2>/dev/null
+                    rmdir "$cg" 2>/dev/null || true
+                done
+            else
+                rm -rf /sys/fs/cgroup/memory/ramlimit_* 2>/dev/null || true
+            fi
+            echo '{}' > "$LIMITS_FILE" 2>/dev/null
+            echo "OK"
+            ;;
+
+        ram_list)
+            if ! command -v jq >/dev/null || [[ ! -f "$LIMITS_FILE" ]]; then echo "[]"; return 0; fi
+            local result="[" first=1 entry pid cmd limit mode current alive
+            while IFS= read -r entry; do
+                [[ -z "$entry" ]] && continue
+                pid=$(jq -r '.key' <<<"$entry")
+                cmd=$(jq -r '.value.cmd' <<<"$entry")
+                limit=$(jq -r '.value.limit_mb' <<<"$entry")
+                mode=$(jq -r '.value.mode // "swap"' <<<"$entry")
+                if ps -p "$pid" >/dev/null 2>&1; then
+                    current=$(( $(ps -p "$pid" -o rss= 2>/dev/null || echo 0) / 1024 ))
+                    alive=1
+                else
+                    current=0; alive=0
+                fi
+                [[ $first -eq 0 ]] && result+=","
+                result+="{\"pid\":${pid},\"cmd\":\"${cmd//\"/}\",\"limit_mb\":${limit},\"mode\":\"${mode}\",\"current_mb\":${current},\"alive\":${alive}}"
+                first=0
+            done < <(jq -c 'to_entries[]' "$LIMITS_FILE" 2>/dev/null)
+            result+="]"
+            echo "$result"
+            ;;
+
+        zswap_set)
+            local field val
+            field=$(awk '{print $1}' <<<"$VALUE")
+            val=$(awk '{$1=""; print substr($0,2)}' <<<"$VALUE")
+            case "$field" in
+                enabled)
+                    [[ "$val" != "0" && "$val" != "1" ]] && { echo "ERROR: enabled must be 0 or 1"; return 1; }
+                    echo "$val" > /sys/module/zswap/parameters/enabled 2>/dev/null && echo "OK" || echo "ERROR: zswap module not present"
+                    ;;
+                compressor)
+                    echo "$val" > /sys/module/zswap/parameters/compressor 2>/dev/null && echo "OK" || echo "ERROR: compressor unsupported by this kernel"
+                    ;;
+                pool)
+                    [[ "$val" =~ ^[0-9]+$ ]] || { echo "ERROR: pool percent must be numeric"; return 1; }
+                    echo "$val" > /sys/module/zswap/parameters/max_pool_percent 2>/dev/null && echo "OK" || echo "ERROR: failed to set pool percent"
+                    ;;
+                *)
+                    echo "ERROR: unknown zswap field '$field'"
+                    ;;
+            esac
+            ;;
+
+        swap_ratio)
+            # VALUE = "<disk_percent> <zswap_percent>" - no interactive confirm here,
+            # the GUI confirms with the user before sending this.
+            local disk zswap swapfile total_swap_kb target_disk_kb target_disk_mb
+            disk=$(awk '{print $1}' <<<"$VALUE")
+            zswap=$(awk '{print $2}' <<<"$VALUE")
+            [[ "$disk" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid disk percent"; return 1; }
+            if [[ -d /sys/module/zswap ]]; then
+                echo "$zswap" > /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || true
+            fi
+            swapfile=$(swapon --show=NAME,TYPE --noheadings 2>/dev/null | awk '$2=="file"{print $1; exit}')
+            if [[ -z "$swapfile" ]]; then
+                echo "OK: zswap ratio set, no file-backed swap to resize"
+                return 0
+            fi
+            total_swap_kb=$(free | awk '/Swap:/{print $2}')
+            target_disk_kb=$(( total_swap_kb * disk / 100 ))
+            target_disk_mb=$(( target_disk_kb / 1024 ))
+            if (( target_disk_mb < 64 )); then
+                echo "OK: zswap ratio set, swapfile resize skipped (target too small)"
+                return 0
+            fi
+            if swapoff "$swapfile" 2>/dev/null && { fallocate -l "${target_disk_mb}M" "$swapfile" 2>/dev/null || dd if=/dev/zero of="$swapfile" bs=1M count="$target_disk_mb" status=none 2>/dev/null; }; then
+                chmod 600 "$swapfile"
+                mkswap "$swapfile" >/dev/null 2>&1
+                swapon "$swapfile"
+                echo "OK"
+            else
+                swapon "$swapfile" 2>/dev/null || true
+                echo "ERROR: swapfile resize failed"
+            fi
+            ;;
+
+        # ---------------------------------------------------------- Drive
+        drive_health)
+            # VALUE = device name, e.g. "sda" or "nvme0n1"
+            local dev="$VALUE"
+            [[ -z "$dev" ]] && { echo "ERROR: no device given"; return 1; }
+            [[ "$dev" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "ERROR: invalid device name"; return 1; }
+            if ! command -v smartctl >/dev/null; then
+                echo "ERROR: smartctl not installed (apt install smartmontools)"; return 1
+            fi
+            local out status
+            out=$(smartctl -H "/dev/${dev}" 2>/dev/null)
+            if grep -qi "PASSED\|OK" <<<"$out"; then
+                status="Healthy"
+            elif grep -qi "FAILED" <<<"$out"; then
+                status="FAILING - back up data"
+            else
+                status="Unknown"
+            fi
+            echo "OK: ${status}"
+            ;;
+
+        # ---------------------------------------------------------- Boost (merged from boost.sh)
+        proc_boost)
+            # VALUE = "<priority> <app_name>"
+            local priority app_name pids count=0
+            priority=$(awk '{print $1}' <<<"$VALUE")
+            app_name=$(awk '{$1=""; print substr($0,2)}' <<<"$VALUE")
+            if [[ -z "$priority" || -z "$app_name" ]]; then echo "ERROR: priority and app name required"; return 1; fi
+            if ! [[ "$priority" =~ ^-?[0-9]+$ ]] || (( priority < -20 || priority > 19 )); then
+                echo "ERROR: priority must be a number from -20 to 19"; return 1
+            fi
+            pids=$(pgrep -i -f "$app_name")
+            if [[ -z "$pids" ]]; then echo "ERROR: process '$app_name' not found/running"; return 1; fi
+            for pid in $pids; do
+                renice -n "$priority" -p "$pid" >/dev/null 2>&1 && ((count++))
+            done
+            if (( count > 0 )); then
+                echo "OK: boosted ${count} process(es) for '${app_name}' to priority ${priority}"
+            else
+                echo "ERROR: found processes but renice failed on all of them"
+            fi
+            ;;
+
+        *)
+            echo "ERROR: unknown action '$ACTION'"
+            ;;
+    esac
+}
+
+ACTION="${1:-}"
+VALUE="${2:-}"
+
+if [[ "$ACTION" == "daemon" ]]; then
+    # Persistent mode: authenticated ONCE by pkexec when this process is
+    # launched, then stays alive reading one "action value" per line from
+    # stdin until the GUI exits or sends "exit". No further password
+    # prompts happen for the rest of the session.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        a="${line%% *}"
+        if [[ "$line" == *" "* ]]; then
+            v="${line#* }"
+        else
+            v=""
+        fi
+        if [[ "$a" == "exit" ]]; then
+            echo "OK"
+            break
+        fi
+        do_action "$a" "$v"
+    done
+    exit 0
+fi
+
+# One-shot mode (kept for manual/CLI use): pkexec cpu_ctrl_helper <action> <value>
+do_action "$ACTION" "$VALUE"
